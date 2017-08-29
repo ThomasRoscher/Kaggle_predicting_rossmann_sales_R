@@ -1,0 +1,587 @@
+---
+title: "Kaggle: Rossman"
+author: "Thomas Roscher"
+date: "`r Sys.Date()`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+    toc: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, fig.height=3, fig.width=7, message=FALSE, warning=FALSE, include=FALSE}
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  library(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+```{r, message=F, warning=F, results='hide'}
+library(readr)     # reading data
+library(dplyr)     # manipulating data
+library(lubridate) # working with dates
+library(ggplot2)   # ploting
+library(forecast)  # for working with time series
+library(VIM)       # visualize NAs
+library(xgboost)   # gradient boosting
+library(caret)     # framework for ML
+library(lsr)     
+```
+
+### Introduction
+
+<p align="justify">
+Rossmann store managers are tasked with predicting their daily sales for up to six weeks in advance. Store sales are influenced by many factors, including promotions, competition, school and state holidays, seasonality, and locality. With thousands of individual managers predicting sales based on their unique circumstances, the accuracy of results can be quite varied. In their first Kaggle competition, Rossmann therefore challenged the Kaggle community to predict 6 weeks of daily sales for stores located across Germany. 
+</p>
+
+### Data Reading
+
+<p align="justify">
+Rossman provided daily historical data for 1,115 stores from 01/01/2013 to 31/07/2013. More precisly, the following features are provided:
+</p>
+
+* Id - an Id that represents a (Store, Date) duple within the test set
+* Store - a unique Id for each store
+* Sales - the turnover for any given day (this is what you are predicting)
+* Customers - the number of customers on a given day
+* Open - an indicator for whether the store was open: 0 = closed, 1 = open
+* StateHoliday - indicates a state holiday. Normally all stores, with few exceptions, are closed on state holidays. Note that all schools are closed on public holidays and weekends. a = public holiday, b = Easter holiday, c = Christmas, 0 = None
+* SchoolHoliday - indicates if the (Store, Date) was affected by the closure of public schools
+* StoreType - differentiates between 4 different store models: a, b, c, d
+* Assortment - describes an assortment level: a = basic, b = extra, c = extended
+* CompetitionDistance - distance in meters to the nearest competitor store
+* CompetitionOpenSince[Month/Year] - gives the approximate year and month of the time the nearest competitor was opened
+* Promo - indicates whether a store is running a promo on that day
+* Promo2 - Promo2 is a continuing and consecutive promotion for some stores: 0 = store is not participating, 1 = store is participating
+*Promo2Since[Year/Week] - describes the year and calendar week when the store started participating in Promo2
+*PromoInterval - describes the consecutive intervals Promo2 is started, naming the months the promotion is started anew. E.g. "Feb,May,Aug,Nov" means each round starts in February, May, August, November of any given year for that store
+
+```{r, message=FALSE, warning=FALSE, cache=T}
+# read and join datasets 
+r_data      <- read_csv("train.csv", col_types ="ncDnncccc")
+r_data2     <- read_csv("store.csv", col_types ='nccnnncnnc', na='')
+r_data3     <- read_csv("test.csv",  col_types ='nncDcccc',   na='')
+train <- inner_join(r_data,  r_data2)
+test  <- inner_join(r_data3, r_data2)
+rm(r_data)
+rm(r_data2)
+rm(r_data3)
+
+# factorize() transforms anything with less then n unique levels to a variable of type factor
+factorize <- function(dataframe, unique_levels = 10) {
+    n_unique_levels   <- sapply(dataframe, function(x) length(unique(x)))
+    factor_var_index  <- which(n_unique_levels < unique_levels)
+    dataframe[ ,factor_var_index] <- lapply(dataframe[ ,factor_var_index], factor)
+    return(dataframe)
+}
+
+# apply factorize() to train an test set
+train <- factorize(train)
+test  <- factorize(test)
+
+# adjust "mistakes" of function factorize()
+train$Promo2SinceYear <- as.numeric(train$Promo2SinceYear) 
+test$Promo2SinceYear  <- as.numeric(test$Promo2SinceYear) 
+
+# check size 
+object.size(train)	
+object.size(test)	
+gc()
+
+# take a look
+glimpse(train)
+```
+
+<p align="justify">
+Usually, the first thing I do after reading in the data (you may also use the fread() function from the data.table for more speed) is checking if the variable classes are correct. While the reading commands often do a great job in setting the correct classes, in some instances column specification fails miserably. This is esspecially true for factor variables which usually get classified as interger or character. Thus, I wrote a function which classifies variables as factor based on their number of unique values. Declaring factor variables as such is very important for training models later on.
+</p>
+
+### Data Exploration
+
+<p align="justify">
+Because it is always worthwhile to take a good hard look at ones data to get acquainted with its quirks and properties, the next step is some uni- and bivariate data exploration. Basically, the most important thing here is to check distributions and to look for any irregularities and patterns. Note, that plots are not supposed to look "dashboard good" for this purpose. 
+</p>
+
+#### Univariate Distributions and NAs 
+
+<p align="justify">
+I prefer using the aggr() function to investigate missing values (NAs) because it not only gives you the proportion of NAs, but also shows which variables are missing in combination. Luckily, NAs do not seem to be such a big issue for this competition. Promo2 related variables (16,17,18) are only "missing" for cases where no promo of type 2 took place. However, variables 13 and 14 indicate that for many of the stores that do have a competing store in range indicated by a value for the variable "CompetitionDistance", no information about the opening date is available.
+</p>
+
+```{r, message=FALSE, warning=FALSE, fig.align='center', cache=T}
+# missing values
+cnames <- colnames(train)
+colnames(train) <- 1:18
+aggr(train, prop = T, numbers = T)
+colnames(train) <- cnames
+```
+
+<p align="justify">
+Next, I check if there are any breaks in the time series. The plot below shows that for the second half of 2014 many stores are not listed in the data which makes sense because Rossmann closed some stores temporarily for refurbishment. Depending on the method for forecasting this gap can become an issue. For example, ARIMA models don't deal well with gaps in the time series. 
+</p>
+
+```{r, fig.align='center', message=FALSE, warning=FALSE}
+# check if number of stores is always 1115
+train %>% 
+    group_by(Date) %>% 
+    summarise(nstores = n()) %>%
+    ggplot(aes(Date, nstores)) + 
+        geom_line(color = "steelblue")
+```
+
+<p align="justify">
+Next, I check the distribution of each variable. For that, I wrote two functions which melt the data to the most possible long format, so that plotting all factor and numeric variables requires less code. 
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=T}
+# uni_factor() plots the distribution of all factor variables
+uni_factor <- function(df){
+    # prepare data
+    is.fact <- sapply(df, is.factor)
+    stack_factor <- df[, is.fact]
+    stack_factor$id <- row.names(stack_factor)
+    stack_factor <- melt(stack_factor, id="id")
+    # plot data
+    ggplot(stack_factor, aes(value)) +
+    geom_bar(fill = "steelblue", color = "white", alpha=.4 ) +
+    facet_wrap(~variable, scales="free") 
+}
+
+# uni_num() plots the distribution of all numeric variables
+uni_num <- function(df){
+    # prepare data
+    is.num <- sapply(df, is.numeric)
+    stack_num <- df[, is.num]
+    stack_num$id <- row.names(stack_num)
+    stack_num <- melt(stack_num, id="id")
+    # plot data
+    ggplot(stack_num, aes(value)) +
+    geom_histogram(fill = "steelblue", color = "white", alpha=.4) +
+    facet_wrap(~variable, scales="free") }
+```
+
+<p align="justify">
+While the plots below offer some insights only few are really noteworthy, including that the data includes many observation were stores were closed and that oddly enough, there seem to be some cases were stores were open, yet sales and customers are zero. More precisely, there are 54 of such instances spread across several stores and dates. So there may be some coding errors here but I'm not familiar enough with Rossmanns data collection procedures to be sure. May just be really bad stores having an even worse day. Besides, assortment type b and store type b are extraordinarily scare. Lastly, it may be a good idea to transform the sales variable due to it's skewness. 
+</p>
+
+```{r, fig.align='center', message=FALSE, warning=FALSE, cache=T}
+# apply functions
+uni_factor(train[-1])
+uni_num(train)
+```
+
+#### Bivariate Distributions and Feature Engineering 1
+
+<p align="justify">
+Before turning to the bivariate analysis I do a little bit of feature engineering. Further feature engineering takes place later on. First, I disaggregate the date variable because breaking down any time related variables to it's smallest components is always advisable. Secondly, I create a variable which indicates how long a competing store exists because I assume that the influence of such stores varies over time. Thirdly, I process similar with promo2 so that I get a variable that indicates for how many consecutive weeks a store participates (Note, that oddly enough in the Rossmann data a year has apparently just 50 weeks). Lastly, I aggregate the two promotion variables to a single factor and keep only observation with sales larger then zero. 
+</p>
+
+```{r, message=FALSE, warning=FALSE, cache=T}
+engineering1 <- function(df){
+    df %>%
+    # drop cases were store is closed
+    # filter(Open == 1) %>%
+    select(-Open) %>%
+    # join promo and promo2 to a single factor
+    mutate(promo_new = ifelse(Promo == 1 & Promo2 == 0, "pr1", 
+                       ifelse(Promo == 0 & Promo2 == 1, "pr2",
+                       ifelse(Promo == 1 & Promo2 == 1, "both", "none")))) %>%
+    mutate(promo_new = as.factor(promo_new)) %>%
+    select(-Promo, -Promo2) %>%
+    # disaggregate date
+    mutate(DayOfMonth = as.integer(lubridate::day(Date))) %>%
+    mutate(Month = as.integer(lubridate::month(Date))) %>%
+    mutate(Year = as.integer(lubridate::year(Date))) %>%
+    mutate(DayOfYear = strftime(Date, format = "%j")) %>%   
+    # create a variable that indicates how long a competing store is open
+    mutate(CompetitionOpenDate = as.Date(ifelse(!is.na(CompetitionOpenSinceYear),
+           paste(CompetitionOpenSinceYear, CompetitionOpenSinceMonth,"01", sep='-'),
+           NA),format="%Y-%m-%d")) %>%
+    mutate(CompetitionDays = (Date-CompetitionOpenDate)) %>%
+    # create a variable that indicates how long promo2 is running 
+    mutate(Promo2Duration = (((Promo2SinceYear-1)*50) + Promo2SinceWeek)) %>%
+    # replace missing CompetitionDistance with mean because there are only a handfull
+    mutate(CompetitionDistance = replace(CompetitionDistance, 
+                                         is.na(CompetitionDistance), 
+                                         mean(CompetitionDistance, na.rm=TRUE))) %>%
+    # remove columns that have been transformed to other/ hopefully better variables
+    select(-CompetitionOpenSinceMonth,
+           -CompetitionOpenSinceYear,
+           -CompetitionOpenDate,
+           -Promo2SinceYear,
+           -Promo2SinceWeek) 
+    # create log sales 
+    # mutate(log_sales = log(Sales))
+}
+
+train <- engineering1(train)
+test  <- engineering1(test)
+
+# extract time series for analysis later on
+sales_ts <- train %>%
+  mutate(date = Date) %>%
+  group_by(date) %>% 
+  summarise(Sales_mm = mean(Sales))
+```
+
+```{r, cache=T}
+p1 <- ggplot(train, aes(DayOfWeek, log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p2 <- ggplot(train, aes(factor(Year), log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p3 <- ggplot(train, aes(factor(Month), log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p4 <- ggplot(train, aes(factor(DayOfMonth), log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p5 <- ggplot(train, aes(StateHoliday, log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p6 <- ggplot(train, aes(SchoolHoliday, log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p7 <- ggplot(train, aes(promo_new, log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p8 <- ggplot(train, aes(StoreType, log_sales, color = Assortment)) + 
+        geom_boxplot(alpha=.4) +
+        theme(legend.position = "bottom")
+# p9 <- ggplot(train, aes(CompetitionDistance, log_sales)) + 
+#        geom_point(alpha = 1/100)
+# p10 <- ggplot(train, aes(CompetitionDays, log_sales)) + 
+#        geom_point(alpha = 1/100) 
+
+ntile_na <- function(x,n)
+{
+  notna <- !is.na(x)
+  out <- rep(NA_real_,length(x))
+  out[notna] <- ntile(x[notna],n)
+  return(out)
+}
+
+train$ntile_cdist <- ntile_na(train$CompetitionDistance, 5)
+train$ntile_cdays <- ntile_na(train$CompetitionDays, 5)
+
+p11 <- ggplot(train, aes(factor(ntile_cdist), log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+p12 <- ggplot(train, aes(factor(ntile_cdays), log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+
+p13 <- ggplot(train, aes(Promo2Duration, log_sales)) + 
+        geom_point(alpha = 1/100) 
+
+train$ntile_pr2d <- ntile_na(train$Promo2Duration, 5)
+p14 <- ggplot(train, aes(factor(train$ntile_pr2d), log_sales)) + 
+        geom_boxplot(fill = "steelblue", color = "black", alpha=.4)
+
+train$ntile_cdist <- NULL
+train$ntile_cdays <- NULL
+train$ntile_pr2d  <- NULL
+```
+
+```{r, fig.align='center', fig.height=3, fig.width=6, message=FALSE, warning=FALSE, cache=T}
+multiplot(p1,  p2,  cols=2)
+multiplot(p3,  p4,  cols=2)
+multiplot(p5,  p6,  cols=2)
+multiplot(p7,  p8,  cols=2)
+multiplot(p11, p12, cols=2)
+multiplot(p13, p14, cols=2)
+```
+
+<p align="justify">
+The plots above again reveal some interesting patterns including the following:
+</p>
+
+* there are clear temporal patterns for DayofWeek, Month, and Day
+* sales are higher if there is a state holiday
+* sales are highest if promotion 1 is running
+* sales are lowest if promotion 2 is running arguably because promotion 2 is used in stores that struggle sales wise
+* assortment c tends to have higher sales
+* stores with close competition have higher sales arguably because they are located in more dense/prosperous/urban areas
+
+#### Patterns over Time
+
+<p align="justify">
+To round the visual exploration of the data up I lastly take a closer look at the mean sales over time. More, precisely I seek to construct a number of component series (that could be used to reconstruct the original by additions or multiplications) where each of these has a certain characteristic or type of behavior. Although the plot is a bit dense one clearly sees that there is a strong seasonal pattern and that 2014 was a pretty good year, though sales went down during the first half of 2015.   
+</p>
+
+```{r,include=TRUE, message=FALSE, warning=FALSE, fig.align='center'}
+# create, plot, and decompose time series
+sales_ts <- ts(sales_ts$Sales_mm, start = decimal_date(as.Date("2013-01-01")), frequency = 365) 
+autoplot(stl(sales_ts, s.window="periodic", robust=TRUE))
+```
+
+### Machine Learning
+
+#### Subset Data and Sampling Straegy
+
+<p align="justify">
+Comparing different feature selections, models, and parameters easily leads to training dozens of different models. Therefore I further sample the training data to keep execution times managable. For this projectz, random sampling dos not make much sense because we got a time series. Thus, I eventually will use only data for the year 2013. In doing so I have data for a whole year to keep seasonal and cyclic patterns and I avoid thre fefurbishment period of 2014.
+</p>
+
+```{r}
+# create subsample
+train <- train %>% filter(Date < "2014-01-01")
+```
+
+#### Cross-Validation and Evaluation Metric
+
+I rely on resampling to estimate model accuracy and avoid overfitting. Here there is the question if one uses regular random cv or rolling time series. I planned using the later. <p align="justify">
+Next, I define the trainControl function which controls the computational nuances of the train function. Basically I use 10-fold-cross validation to avoid overfitting, allow parrallel computation to speed things up, use savePredictions = "final" to save RAM, and provide the user written evaluation metric. Simple random sampling of time series is probably not the best way to resample times series data. Hyndman and Athanasopoulos (2013) discuss rolling forecasting origin techniques that move the training and test sets in time. caret contains a function called createTimeSlices that can create the indices for this type of splitting. Rossmann evaluates any submissions on the Root Mean Square Percentage Error (RMSPE) I therefore firstly need to define a corresponding summary function because RMSPE is not included on the default metrics provided by caret.
+</p>
+
+```{r}
+# define RMSPE as metric
+rmspeSummary <- function (data,
+                          lev = NULL,
+                          model = NULL) {
+  
+  # RMSPE
+  out <- sqrt(mean(((data$obs-data$pred)/data$obs)^2))
+  names(out) <- "RMSPE"
+  out
+}
+
+# define trainControl for cv
+trainControl <- trainControl(# 10-fold-cv
+                             method = "cv", 
+                             number = 5,
+                             # only save prediction of the final model
+                             savePredictions = "final",
+                             # provide user written summary function
+                             summaryFunction = rmspeSummary,
+                             # allow parralel computing
+                             allowParallel=TRUE
+                             )
+
+#  trainControl for rolling cv 
+# trainControl <- trainControl(method = "timeslice",
+#                             initialWindow = (30*1115),
+#                             horizon = (48*1115),
+#                             fixedWindow = FALSE,
+#                             savePredictions = "final",
+#                             # provide user written summary function
+#                             summaryFunction = rmspeSummary,
+#                             # allow parralel computing
+#                             allowParallel=TRUE
+#                              )
+```
+
+
+#### Feature Engineering
+
+<p align="justify">
+Feature engineering attempts to increase the predictive power of learning algorithms by creating features from raw data that help facilitate the learning process. The basic idea is to combine, group, and transform given features to new ones. For this project I focus on mean sales per store which is further grouped by several temporal units and store properties, respectively. I thought about using lagged values or mean values for the last N days as well. The thing though is that such an approach requires a step-wise prediction for the sales value in the test data. Thus, I only calculate mean sales per customer and group mean sales grouped by:
+</p>
+
+1. store and day of month
+2. store and month
+3. store and day of the week
+4. store and day of year
+5. store and promotion
+
+```{r}
+train <- train %>%
+    # drop observation with no sales
+    filter(Sales > 0) %>%
+    # mean sales by
+    # store, day
+    group_by(Store, DayOfMonth) %>%
+    mutate(msales_sdm = mean(Sales)) %>%
+    # store, month
+    group_by(Store, Month) %>%
+    mutate(msales_sm = mean(Sales)) %>%
+    # store, day of week
+    group_by(Store, DayOfWeek) %>%
+    mutate(msales_sdw = mean(Sales)) %>%
+    # store, day of year
+    group_by(Store, DayOfYear) %>%
+    mutate(msales_sdy = mean(Sales)) %>%
+    # store, promo
+    group_by(Store, promo_new) %>%
+    mutate(msales_sp = mean(Sales)) %>%
+    # store, holiday
+    group_by(Store, SchoolHoliday) %>%
+    mutate(msales_sh = mean(Sales)) %>%
+    # store
+    group_by(Store) %>%
+    mutate(msales_sc = mean(Sales)/mean(Customers))
+    # last mean sales last 48 days
+    # group_by(Store) %>%
+    # mutate(sales_lag1 = lag(Sales, n = 1)) %>%
+    # mutate(msales_60 = rollapply(data = sales_lag1, 
+    #                        width = 60, 
+    #                        FUN = mean, 
+    #                        align = "right", 
+    #                        fill = NA, 
+    #                        na.rm = T)) %>%
+    # select(-sales_lag1)
+```
+
+<p align="justify">
+Obviously, the train data and the test data must be identical later on. That's the reason why I applied the function engineering1 to test data earlier on. For, the new features this approach will not work because obviously there is no sales or customer data available. Thus, I need to add the variables to the test set by joining. 
+</p>
+
+```{r}
+# extract new features with semi-join
+df.msales_sdm  <- semi_join(train[,c(1, 13, 19)], test) %>% distinct(DayOfMonth, msales_sdm)
+df.msales_sm   <- semi_join(train[,c(1, 14, 20)], test) %>% distinct(Month, msales_sm)  
+df.msales_sdw  <- semi_join(train[,c(1, 2, 21)], test)  %>% distinct(DayOfWeek, msales_sdw)
+df.msales_sdy  <- semi_join(train[,c(1, 16, 22)], test) %>% distinct(DayOfYear, msales_sdy)
+df.msales_sp   <- semi_join(train[,c(1, 12, 23)], test) %>% distinct(promo_new, msales_sp)
+df.msales_sh   <- semi_join(train[,c(1, 7, 24)], test)  %>% distinct(SchoolHoliday, msales_sh)
+df.msales_sc   <- semi_join(train[,c(1, 25)], test) %>% distinct(msales_sc)
+ 
+# add new features with left-join
+test <- test %>% 
+ left_join(df.msales_sdm)  %>% 
+ left_join(df.msales_sm) %>% 
+ left_join(df.msales_sdw) %>% 
+ left_join(df.msales_sdy) %>% 
+ left_join(df.msales_sp) %>% 
+ left_join(df.msales_sh) %>% 
+ left_join(df.msales_sc) 
+
+# remove 
+rm(list = ls()[grep("^df.", ls())])
+```
+
+#### Training Models with Extreme Gradient Boosting
+
+<p align="justify">
+Obviously the first question that rises at this point is which algorithms are best to train a model on my data. Usually I start with a handlfull of commom algorithms and compare their performance on small baseline models (often samples of the training data). This time however I wanted to focus on the infamous XGBoost algorithm because it has recently been dominating applied machine learning and Kaggle competitions. XGBoost basically is an implementation of gradient boosted decision trees especially designed for speed and performance. So why use XGBoost in the first place? Well, it is versatile in a sense that it handles classification as well as regression problems, it deals with missing values which is important if you have NAs that can not be imputed, and lastly, it's fast and it's accurate. Other advantages that basically refer to the framework offered by the package are also covered by the awesome caret package (e.g the train() function).
+</p>
+
+#### Training the models
+
+<p align="justify">
+Next, I need to specify the train function. Here I use all 23 features without any pre-processing or paramater tuning. Note, that all factor variables are automatically transfered into corresponding dummy variables (aka one-hot-encoding). 
+</p>
+
+```{r}
+# train with default values
+set.seed(1234)
+xgb_fit_1 <- train(Sales ~ .,
+                  data       = train[,-c(3,5,22)], 
+                  method     = "xgbLinear",
+                  metric     = "RMSPE",
+                  maximize   = FALSE,
+                  trControl  = trainControl,
+                  na.action  = na.pass,
+                  tuneLength = 1)
+
+xgb_fit_1
+saveRDS(xgb_fit_1, "xgb_fit1.rds")
+```
+
+<p align="justify">
+Although the collection of bagged trees is much more difficult to interpret than a single tree, one can obtain an overall summary of the importance of each predictor using the residual sum of squares (for bagging regression trees). 
+</p>
+
+```{r}
+# get variable importance
+xgb_fit_1_Imp <- varImp(xgb_fit_1, scale = FALSE)
+xgb_fit_1_Imp 
+```
+
+```{r}
+# only keep complete cases otherwise pca won't work
+train_red <- train[sapply(train, function(x) !any(is.na(x)))] 
+
+set.seed(1234)
+# train with pca 
+xgb_fit_2 <- train(Sales ~ .,
+                  data       = train_red [,-c(3,5,14,15,18)], 
+                  method     = "xgbLinear",
+                  metric     = "RMSPE",
+                  maximize   = FALSE,
+                  trControl  = trainControl,
+                  na.action  = na.pass,
+                  tuneLength = 1,
+                  preProcess = c("center", "scale", "pca"))
+
+xgb_fit_2
+saveRDS(xgb_fit_2, "xgb_fit2.rds")
+
+# get variable importance
+xgb_fit_2_Imp <- varImp(xgb_fit_2, scale = FALSE)
+xgb_fit_2_Imp 
+
+results <- resamples(list(xgb = xgb_fit_1, xgb_pca = xgb_fit_2))
+dotplot(results)
+```
+
+<p align="justify">
+Next, tune parameters to impove results. I use the second model as a basisi because it yielded better results. Caret offers a handy function to quickly see which parameters are tuneable in the first place. </p>
+
+```{r}
+modelLookup("xgbLinear")
+```
+
+<p align="justify">
+So what we see above is that we can tune the following four parameters:
+</p>
+
+* nrounds (Boosting Iterations)
+* lambda (L2 Regularization)
+* alpha (L1 Regularization)
+* eta (Learning Rate) 
+</p>
+
+### Tune Parameters
+
+Tuning parameters may be done with tuneLength() using n fixed values for each paramters, with a random tune grid, or with a user written tune grid. I choose the latter appraoch. 
+</p>
+
+```{r}
+ xgb_grid_1 <- expand.grid(
+  nrounds = c(100, 500, 750, 1000),
+  eta = c(0.01, 0.05, 0.1, 0,15),
+  lambda = 1,
+  alpha = 0
+)
+
+xgb_fit_3 <- train(Sales ~ .,
+                  data       = train_red[,-c(3,5,19)], 
+                  method     = "xgbLinear",
+                  metric     = "RMSPE",
+                  maximize   = FALSE,
+                  trControl  = trainControl,
+                  na.action  = na.pass,
+                  tuneLength = 1,
+                  # preProcess = c("center", "scale", "pca"),
+                  tuneGrid = xgb_grid_1
+)
+```
